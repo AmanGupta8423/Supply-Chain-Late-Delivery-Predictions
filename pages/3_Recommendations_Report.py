@@ -1,147 +1,527 @@
+
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-from datetime import datetime
+import numpy as np
 
-from src.data import load_dataset
-from src.analytics import delay_rate_by
-
-st.set_page_config(page_title="Recommendations & Report", page_icon="🧭", layout="wide")
-st.title("🧭 Recommendations & Executive Report")
-st.caption("Evidence-led operational recommendations based on observed historical delay patterns.")
-
-try:
-    df = load_dataset()
-except Exception as exc:
-    st.error(f"Could not load dataset: {exc}")
-    st.stop()
-
-regions = ["All regions"] + sorted(df["Order Region"].dropna().unique().tolist())
-selected_region = st.selectbox("Select an order region", regions)
-scope = df if selected_region == "All regions" else df[df["Order Region"] == selected_region].copy()
-
-if scope.empty:
-    st.warning("No records found for this selection.")
-    st.stop()
-
-overall_rate = scope["Is_Delayed"].mean() * 100
-late_count = int(scope["Is_Delayed"].sum())
-avg_late_delay = scope.loc[scope["Is_Delayed"] == 1, "Delay"].mean()
-
-a, b, c = st.columns(3)
-a.metric("Orders in scope", f"{len(scope):,}")
-b.metric("Actual late-delivery rate", f"{overall_rate:.1f}%")
-c.metric("Average delay among late orders", f"{avg_late_delay:.2f} days" if pd.notna(avg_late_delay) else "N/A")
-
-st.markdown("---")
-st.markdown("### Highest observed delay drivers")
-driver_columns = ["Shipping Mode", "Customer Segment", "Department Name", "Type", "Order Status"]
-driver_frames = []
-for col in driver_columns:
-    if col in scope.columns:
-        temp = delay_rate_by(scope, col, min_orders=30)
-        if not temp.empty:
-            temp["Driver"] = col
-            temp["Factor Level"] = col + " : " + temp[col].astype(str)
-            driver_frames.append(temp[["Driver", "Factor Level", "total_orders", "late_orders", "delay_pct", "avg_delay"]])
-
-if driver_frames:
-    drivers = pd.concat(driver_frames, ignore_index=True)
-    top_drivers = drivers.sort_values("delay_pct", ascending=False).head(10)
-    fig = px.bar(
-        top_drivers.sort_values("delay_pct"),
-        x="delay_pct", y="Factor Level", color="delay_pct",
-        orientation="h", text_auto=".1f",
-        title="Top 10 factor levels by observed late-delivery rate",
-        labels={"delay_pct": "Late delivery rate (%)", "Factor Level": "Driver factor"},
-    )
-    fig.update_layout(coloraxis_showscale=False)
-    st.plotly_chart(fig, use_container_width=True)
-    st.dataframe(top_drivers, use_container_width=True, hide_index=True)
-else:
-    drivers = pd.DataFrame()
-    st.info("Not enough records to calculate driver-level rates.")
-
-st.markdown("### Recommended mitigation actions")
-recommendations = []
-
-if overall_rate >= 50:
-    recommendations.append({
-        "Priority": "High",
-        "Observation": f"Late-delivery rate is {overall_rate:.1f}% in the selected scope.",
-        "Recommended action": "Run a daily exception review for orders at risk; assign an owner and escalation deadline to each exception.",
-        "Measure": "Late-delivery rate and number of unresolved exceptions",
-    })
-else:
-    recommendations.append({
-        "Priority": "Medium",
-        "Observation": f"Late-delivery rate is {overall_rate:.1f}% in the selected scope.",
-        "Recommended action": "Maintain routine monitoring and investigate segments that perform materially worse than the overall baseline.",
-        "Measure": "Weekly late-delivery rate by region and shipping mode",
-    })
-
-if not drivers.empty:
-    for _, row in top_drivers.head(4).iterrows():
-        driver = row["Driver"]
-        level = str(row["Factor Level"]).split(" : ", 1)[-1]
-        rate = row["delay_pct"]
-        if driver == "Shipping Mode":
-            action = "Review carrier capacity, pickup cut-off times, route coverage, and service-level commitments for this shipping mode."
-        elif driver == "Type":
-            action = "Check whether payment authorization or payment-release timing is delaying order release; coordinate payment and fulfilment teams."
-        elif driver == "Customer Segment":
-            action = "Review service promises and order-priority rules for this customer segment; validate whether current capacity matches demand."
-        elif driver == "Department Name":
-            action = "Audit inventory availability, picking/packing queues, and replenishment lead times for this department."
-        else:
-            action = "Review the operational workflow and hand-offs for this order-status group; identify where orders wait longest."
-        recommendations.append({
-            "Priority": "High" if rate >= overall_rate + 5 else "Medium",
-            "Observation": f"{driver} = {level} has an observed late-delivery rate of {rate:.1f}% ({int(row['total_orders']):,} orders).",
-            "Recommended action": action,
-            "Measure": "Compare late-delivery rate and average delay before vs. after intervention",
-        })
-
-rec_df = pd.DataFrame(recommendations).drop_duplicates(subset=["Observation"])
-st.dataframe(rec_df, use_container_width=True, hide_index=True)
-
-st.markdown("### Executive summary")
-summary = f"""
-# Supply Chain Late Delivery – Executive Summary
-
-**Report generated:** {datetime.now().strftime("%d %b %Y, %H:%M")}
-
-**Scope:** {selected_region}
-
-- Orders analysed: {len(scope):,}
-- Orders flagged as actually delayed (Delay > 0): {late_count:,}
-- Actual late-delivery rate: {overall_rate:.1f}%
-- Average delay among late orders: {avg_late_delay:.2f} days
-- Profit sum across selected orders: ${scope['Order Profit Per Order'].sum():,.2f}
-
-## Recommended actions
-
-""" + "\n".join(
-    f"{i}. **{row['Priority']} priority – {row['Observation']}**\n   - {row['Recommended action']}\n   - Measure: {row['Measure']}"
-    for i, row in rec_df.iterrows()
-) + """
-
-## Interpretation note
-These findings describe associations in historical data. They do not establish that a factor causes delays. Validate operational causes with carrier, warehouse, inventory, and order-level investigations before changing policy.
-"""
-
-st.markdown(summary)
-st.download_button(
-    "Download executive report (Markdown)",
-    summary.encode("utf-8"),
-    "supply_chain_executive_report.md",
-    "text/markdown",
+st.set_page_config(
+    page_title="SCM Recommendations",
+    page_icon="💡",
+    layout="wide"
 )
 
-if not drivers.empty:
-    st.download_button(
-        "Download driver analysis (CSV)",
-        drivers.to_csv(index=False).encode("utf-8"),
-        "late_delivery_driver_analysis.csv",
-        "text/csv",
+st.title("💡 Supply Chain Improvement Recommendations")
+
+st.markdown(
+    """
+    A decision-support page translating supply chain performance
+    metrics into actionable operational improvements.
+
+    Recommendations focus on delivery reliability, transportation
+    efficiency, order fulfilment and profitability.
+    """
+)
+
+st.markdown("---")
+
+
+# --------------------------------------------------
+# LOAD DATA
+# --------------------------------------------------
+
+@st.cache_data
+def load_data():
+
+    df = pd.read_csv(
+        "DataCoSupplyChainDataset2.csv",
+        encoding="latin1"
     )
+
+    df.columns = df.columns.str.strip()
+
+    df["Days for shipment (scheduled)"] = pd.to_numeric(
+        df["Days for shipment (scheduled)"],
+        errors="coerce"
+    )
+
+    df["Days for shipping (real)"] = pd.to_numeric(
+        df["Days for shipping (real)"],
+        errors="coerce"
+    )
+
+    df["Order Profit Per Order"] = pd.to_numeric(
+        df["Order Profit Per Order"],
+        errors="coerce"
+    )
+
+    df["Delay"] = (
+        df["Days for shipping (real)"]
+        - df["Days for shipment (scheduled)"]
+    )
+
+    df["Is_Delayed"] = (df["Delay"] > 0).astype(int)
+
+    return df
+
+
+df = load_data()
+
+
+# --------------------------------------------------
+# FILTERS
+# --------------------------------------------------
+
+st.header("Analysis Scope")
+
+filter_columns = [
+    "Order Region",
+    "Customer Segment",
+    "Shipping Mode",
+    "Department Name"
+]
+
+filter_cols = st.columns(4)
+
+selected_filters = {}
+
+for i, col in enumerate(filter_columns):
+
+    options = sorted(
+        df[col].dropna().astype(str).unique().tolist()
+    )
+
+    with filter_cols[i]:
+
+        selected_filters[col] = st.selectbox(
+            col,
+            ["All"] + options
+        )
+
+filtered_df = df.copy()
+
+for col, value in selected_filters.items():
+
+    if value != "All":
+
+        filtered_df = filtered_df[
+            filtered_df[col].astype(str) == value
+        ]
+
+if filtered_df.empty:
+
+    st.warning("No records available for the selected filters.")
+    st.stop()
+
+
+# --------------------------------------------------
+# PERFORMANCE INDICATORS
+# --------------------------------------------------
+
+total_orders = len(filtered_df)
+
+delayed_orders = filtered_df["Is_Delayed"].sum()
+
+delay_rate = (
+    delayed_orders / total_orders * 100
+    if total_orders > 0 else 0
+)
+
+avg_delay = filtered_df.loc[
+    filtered_df["Is_Delayed"] == 1,
+    "Delay"
+].mean()
+
+avg_scheduled_days = filtered_df[
+    "Days for shipment (scheduled)"
+].mean()
+
+avg_actual_days = filtered_df[
+    "Days for shipping (real)"
+].mean()
+
+total_profit = filtered_df[
+    "Order Profit Per Order"
+].sum()
+
+avg_profit = filtered_df[
+    "Order Profit Per Order"
+].mean()
+
+
+# --------------------------------------------------
+# KPI SECTION
+# --------------------------------------------------
+
+st.markdown("---")
+st.header("Supply Chain Performance Overview")
+
+c1, c2, c3, c4 = st.columns(4)
+
+c1.metric(
+    "Total Orders",
+    f"{total_orders:,}"
+)
+
+c2.metric(
+    "Delayed Orders",
+    f"{delayed_orders:,}"
+)
+
+c3.metric(
+    "Delay Rate",
+    f"{delay_rate:.1f}%"
+)
+
+c4.metric(
+    "Average Delay",
+    f"{avg_delay:.2f} days"
+    if pd.notna(avg_delay) else "N/A"
+)
+
+c5, c6, c7 = st.columns(3)
+
+c5.metric(
+    "Avg. Scheduled Shipping",
+    f"{avg_scheduled_days:.2f} days"
+)
+
+c6.metric(
+    "Avg. Actual Shipping",
+    f"{avg_actual_days:.2f} days"
+)
+
+c7.metric(
+    "Total Order Profit",
+    f"${total_profit:,.0f}"
+)
+
+st.caption(
+    f"Recommendations are based on {total_orders:,} filtered orders."
+)
+
+
+# --------------------------------------------------
+# HELPER FUNCTIONS
+# --------------------------------------------------
+
+def get_delay_rate(data, category):
+
+    result = (
+        data.groupby(category)
+        .agg(
+            total_orders=("Is_Delayed", "count"),
+            delayed_orders=("Is_Delayed", "sum")
+        )
+        .reset_index()
+    )
+
+    result["delay_rate"] = (
+        result["delayed_orders"]
+        / result["total_orders"] * 100
+    )
+
+    return result
+
+
+recommendations = []
+
+
+def add_recommendation(
+    priority,
+    area,
+    observation,
+    recommendation,
+    expected_impact
+):
+
+    recommendations.append({
+        "Priority": priority,
+        "Area": area,
+        "Observation": observation,
+        "Recommended Action": recommendation,
+        "Expected Impact": expected_impact
+    })
+
+
+# --------------------------------------------------
+# 1. DELIVERY PERFORMANCE
+# --------------------------------------------------
+
+st.markdown("---")
+st.header("1. Delivery Performance Improvement")
+
+if delay_rate > 30:
+
+    add_recommendation(
+        "High",
+        "Delivery Reliability",
+        f"{delay_rate:.1f}% of orders are delayed.",
+        "Introduce delivery control-tower monitoring, "
+        "exception alerts and daily review of delayed shipments. "
+        "Prioritise orders approaching their committed delivery date.",
+        "Improved delivery reliability and fewer delayed orders."
+    )
+
+elif delay_rate > 15:
+
+    add_recommendation(
+        "Medium",
+        "Delivery Reliability",
+        f"Delay rate is {delay_rate:.1f}%.",
+        "Review recurring delay patterns by region and shipping mode. "
+        "Introduce weekly carrier performance reviews and "
+        "proactive shipment tracking.",
+        "Better delivery visibility and operational control."
+    )
+
+else:
+
+    add_recommendation(
+        "Low",
+        "Delivery Reliability",
+        f"Delay rate is {delay_rate:.1f}%.",
+        "Maintain existing delivery controls and monitor "
+        "service-level performance to prevent deterioration.",
+        "Sustained delivery performance."
+    )
+
+
+# --------------------------------------------------
+# 2. TRANSPORTATION AND SHIPPING
+# --------------------------------------------------
+
+st.markdown("---")
+st.header("2. Transportation & Shipping Optimization")
+
+shipping_analysis = get_delay_rate(
+    filtered_df,
+    "Shipping Mode"
+)
+
+if not shipping_analysis.empty:
+
+    worst_shipping = shipping_analysis.sort_values(
+        "delay_rate",
+        ascending=False
+    ).iloc[0]
+
+    st.write("**Shipping Mode Performance**")
+
+    st.dataframe(
+        shipping_analysis.sort_values(
+            "delay_rate",
+            ascending=False
+        ).round(2),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    if worst_shipping["delay_rate"] > delay_rate:
+
+        add_recommendation(
+            "High",
+            "Transportation",
+            f"{worst_shipping['Shipping Mode']} has a "
+            f"{worst_shipping['delay_rate']:.1f}% delay rate.",
+            "Conduct a carrier and lane-level performance review "
+            "for this shipping mode. Evaluate transit-time variability, "
+            "handover delays and route reliability before reallocating "
+            "shipment volumes.",
+            "Improved carrier accountability and more reliable transit times."
+        )
+
+
+# --------------------------------------------------
+# 3. REGIONAL BOTTLENECKS
+# --------------------------------------------------
+
+st.markdown("---")
+st.header("3. Regional Bottleneck Management")
+
+region_analysis = get_delay_rate(
+    filtered_df,
+    "Order Region"
+)
+
+if not region_analysis.empty:
+
+    worst_region = region_analysis.sort_values(
+        "delay_rate",
+        ascending=False
+    ).iloc[0]
+
+    st.write("**Regional Delivery Performance**")
+
+    st.dataframe(
+        region_analysis.sort_values(
+            "delay_rate",
+            ascending=False
+        ).round(2),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    if worst_region["delay_rate"] > delay_rate:
+
+        add_recommendation(
+            "High",
+            "Regional Operations",
+            f"{worst_region['Order Region']} records a "
+            f"{worst_region['delay_rate']:.1f}% delay rate.",
+            "Investigate regional distribution constraints, "
+            "transportation connectivity, fulfilment capacity "
+            "and last-mile delivery performance. Consider "
+            "regional safety stock or alternate fulfilment locations "
+            "only after validating demand and service requirements.",
+            "Reduced regional delivery bottlenecks."
+        )
+
+
+# --------------------------------------------------
+# 4. CUSTOMER SEGMENT
+# --------------------------------------------------
+
+st.markdown("---")
+st.header("4. Customer Service Level Management")
+
+segment_analysis = get_delay_rate(
+    filtered_df,
+    "Customer Segment"
+)
+
+if not segment_analysis.empty:
+
+    worst_segment = segment_analysis.sort_values(
+        "delay_rate",
+        ascending=False
+    ).iloc[0]
+
+    st.write("**Customer Segment Performance**")
+
+    st.dataframe(
+        segment_analysis.sort_values(
+            "delay_rate",
+            ascending=False
+        ).round(2),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    if worst_segment["delay_rate"] > delay_rate:
+
+        add_recommendation(
+            "Medium",
+            "Customer Service",
+            f"{worst_segment['Customer Segment']} has a "
+            f"{worst_segment['delay_rate']:.1f}% delay rate.",
+            "Review service-level commitments, order handling "
+            "and fulfilment priorities for this customer segment. "
+            "Align delivery promises with actual logistics capability.",
+            "Improved customer experience and service-level adherence."
+        )
+
+
+# --------------------------------------------------
+# 5. PROFITABILITY
+# --------------------------------------------------
+
+st.markdown("---")
+st.header("5. Profitability & Operational Efficiency")
+
+if total_profit < 0:
+
+    add_recommendation(
+        "High",
+        "Profitability",
+        f"Aggregate order profit is ${total_profit:,.0f}.",
+        "Perform order-level profitability analysis covering "
+        "transportation cost, discounts, fulfilment expenses "
+        "and product margins. Identify loss-making order segments "
+        "before changing pricing or service policies.",
+        "Better cost visibility and protection of order margins."
+    )
+
+else:
+
+    add_recommendation(
+        "Medium",
+        "Profitability",
+        f"Aggregate order profit is ${total_profit:,.0f}.",
+        "Analyse profitability across shipping modes and delay "
+        "categories. Evaluate whether premium transportation "
+        "options generate sufficient incremental margin "
+        "to justify their cost.",
+        "Improved transportation cost-to-service trade-off."
+    )
+
+
+# --------------------------------------------------
+# 6. INVENTORY AND FULFILMENT
+# --------------------------------------------------
+
+st.markdown("---")
+st.header("6. Inventory & Order Fulfilment")
+
+add_recommendation(
+    "Medium",
+    "Inventory Planning",
+    "Delivery delays can be influenced by inventory availability "
+    "and fulfilment readiness; this dataset does not directly "
+    "confirm stockout events.",
+    "Integrate inventory availability, SKU-level demand forecasts "
+    "and warehouse fulfilment data. Monitor stockout frequency, "
+    "order fulfilment cycle time and backorders to identify "
+    "inventory-related delivery constraints.",
+    "Improved fulfilment readiness and inventory visibility."
+)
+
+
+# --------------------------------------------------
+# 7. ACTIONABLE RECOMMENDATION SUMMARY
+# --------------------------------------------------
+
+st.markdown("---")
+st.header("7. Prioritized Action Plan")
+
+recommendation_df = pd.DataFrame(recommendations)
+
+priority_order = {
+    "High": 0,
+    "Medium": 1,
+    "Low": 2
+}
+
+recommendation_df["_priority_order"] = (
+    recommendation_df["Priority"].map(priority_order)
+)
+
+recommendation_df = (
+    recommendation_df
+    .sort_values("_priority_order")
+    .drop(columns="_priority_order")
+)
+
+for _, row in recommendation_df.iterrows():
+
+    with st.expander(
+        f"{row['Priority']} Priority | {row['Area']}",
+        expanded=(row["Priority"] == "High")
+    ):
+
+        st.markdown("**Performance Observation**")
+        st.write(row["Observation"])
+
+        st.markdown("**Recommended SCM Action**")
+        st.write(row["Recommended Action"])
+
+        st.markdown("**Expected Operational Impact**")
+        st.write(row["Expected Impact"])
+
+
+st.markdown("---")
+
+st.caption(
+    "Note: Recommendations are generated from observed dataset "
+    "patterns. Operational actions should be validated using "
+    "carrier, inventory, transportation cost and warehouse-level data "
+    "before implementation."
+)
